@@ -30,12 +30,8 @@ LifecycleManagerClient::LifecycleManagerClient(
   const std::string & name,
   const std::string & ns)
 {
-  if (namespace_ != "") {
-    namespace_ += "/";
-  }
-
-  manage_service_name_ = namespace_ + name + std::string("/manage_nodes");
-  active_service_name_ = namespace_ + name + std::string("/is_active");
+  manage_service_name_ = name + std::string("/manage_nodes");
+  active_service_name_ = name + std::string("/is_active");
 
   // Create the node to use for all of the service clients
   node_ = std::make_shared<rclcpp::Node>(name + "_service_client", ns);
