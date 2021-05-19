@@ -12,11 +12,17 @@ _commands:
       steps:
         - restore_cache:
             name: Restore Cache << parameters.key >>
-            key: "<< parameters.key >>-v1\
-              -{{ arch }}\
-              -{{ .Branch }}\
-              -{{ .Environment.CIRCLE_PR_NUMBER }}\
-              -{{ checksum  \"<< parameters.workspace >>/checksum.txt\" }}"
+            keys:
+              - "<< parameters.key >>-v1\
+                -{{ arch }}\
+                -{{ .Branch }}\
+                -{{ .Environment.CIRCLE_PR_NUMBER }}\
+                -{{ checksum  \"<< parameters.workspace >>/lockfile.txt\" }}"
+              - "<< parameters.key >>-v1\
+                -{{ arch }}\
+                -main\
+                -<no value>\
+                -{{ checksum  \"<< parameters.workspace >>/lockfile.txt\" }}"
     save_to_cache:
       description: "Save To Cache"
       parameters:
@@ -36,10 +42,12 @@ _commands:
               -{{ arch }}\
               -{{ .Branch }}\
               -{{ .Environment.CIRCLE_PR_NUMBER }}\
-              -{{ checksum  \"<< parameters.workspace >>/checksum.txt\" }}\
+              -{{ checksum  \"<< parameters.workspace >>/lockfile.txt\" }}\
               -{{ epoch }}"
             paths:
-              - << parameters.path >>
+              - << parameters.path >>/build
+              - << parameters.path >>/install
+              - << parameters.path >>/log
             when: << parameters.when >>
     install_dependencies:
       description: "Install Dependencies"
@@ -54,13 +62,13 @@ _commands:
             working_directory: << parameters.workspace >>
             command: |
               . << parameters.underlay >>/install/setup.sh
-              cat << parameters.underlay >>/checksum.txt > checksum.txt
-              vcs export --exact src | \
-                (echo vcs_export && cat) >> checksum.txt
-              sha256sum $PWD/checksum.txt >> checksum.txt
+              cat << parameters.underlay >>/lockfile.txt > lockfile.txt
+              vcs export --exact << parameters.underlay >>/src | \
+                (echo vcs_export && cat) >> lockfile.txt
+              sha256sum $PWD/lockfile.txt >> lockfile.txt
               apt-get update
               rosdep update
-              
+
               # workarround for OMPL and rosdep
               # https://github.com/ompl/ompl/issues/753
               # Prevent searching $ROS_WS/install given it's too big for rosdep
@@ -85,8 +93,8 @@ _commands:
                 awk -F'[][]' '{print $2}' | \
                 tr -d \, | xargs -n1 | sort -u | xargs)
               dpkg -s $dependencies | \
-                (echo workspace_dependencies && cat) >> checksum.txt
-              sha256sum $PWD/checksum.txt >> checksum.txt
+                (echo workspace_dependencies && cat) >> lockfile.txt
+              sha256sum $PWD/lockfile.txt >> lockfile.txt
     setup_workspace:
       description: "Setup Workspace"
       parameters:
@@ -103,7 +111,7 @@ _commands:
           type: boolean
       steps:
         - store_artifacts:
-            path: << parameters.workspace >>/checksum.txt
+            path: << parameters.workspace >>/lockfile.txt
         - restore_from_cache:
             key: << parameters.key >>
             workspace: << parameters.workspace >>
@@ -114,21 +122,55 @@ _commands:
                   name: Build Workspace | << parameters.workspace >>
                   working_directory: << parameters.workspace >>
                   command: |
-                    BUILD_UNFINISHED=$(colcon list --packages-skip-build-finished)
-                    BUILD_FAILED=$(colcon list --packages-select-build-failed)
-                    if [ -n "$BUILD_UNFINISHED" ] || [ -n "$BUILD_FAILED" ]
+                    colcon cache lock
+
+                    BUILD_UNFINISHED=$(
+                      colcon list \
+                        --names-only \
+                        --packages-skip-build-finished \
+                      | xargs)
+                    echo BUILD_UNFINISHED: $BUILD_UNFINISHED
+
+                    BUILD_FAILED=$(
+                      colcon list \
+                        --names-only \
+                        --packages-select-build-failed \
+                      | xargs)
+                    echo BUILD_FAILED: $BUILD_FAILED
+
+                    BUILD_INVALID=$(
+                      colcon list \
+                        --names-only \
+                        --packages-select-cache-invalid \
+                        --packages-select-cache-key build \
+                      | xargs)
+                    echo BUILD_INVALID: $BUILD_INVALID
+
+                    BUILD_PACKAGES=""
+                    if [ -n "$BUILD_UNFINISHED" ] || \
+                       [ -n "$BUILD_FAILED" ] || \
+                       [ -n "$BUILD_INVALID" ]
                     then
-                      . << parameters.underlay >>/install/setup.sh
-                      rm -rf build install log
-                      colcon build \
-                        --mixin << parameters.mixins >>
-                    else
-                      echo "Skipping Build"
+                      BUILD_PACKAGES=$(
+                        colcon list \
+                          --names-only \
+                          --packages-above \
+                            $BUILD_UNFINISHED \
+                            $BUILD_FAILED \
+                            $BUILD_INVALID \
+                        | xargs)
                     fi
+                    echo BUILD_PACKAGES: $BUILD_PACKAGES
+
+                    . << parameters.underlay >>/install/setup.sh
+                    colcon build \
+                      --packages-select ${BUILD_PACKAGES} \
+                      --mixin << parameters.mixins >>
               - save_to_cache:
                   key: << parameters.key >>
                   path: << parameters.workspace >>
                   workspace: << parameters.workspace >>
+                  when: always
               - run:
                   name: Copy Build Logs
                   working_directory: << parameters.workspace >>
@@ -139,28 +181,72 @@ _commands:
     test_workspace:
       description: "Test Workspace"
       parameters:
+        key:
+          type: string
         workspace:
           type: string
+        cache_test:
+          type: boolean
       steps:
         - run:
             name: Test Workspace | << parameters.workspace >>
             working_directory: << parameters.workspace >>
             command: |
-              . install/setup.sh
+              TEST_FAILURES=$(
+                colcon list \
+                  --names-only \
+                  --packages-select-test-failures \
+                | xargs)
+              echo TEST_FAILURES: $TEST_FAILURES
+
+              TEST_INVALID=$(
+                colcon list \
+                  --names-only \
+                  --packages-select-cache-invalid \
+                  --packages-select-cache-key test \
+                | xargs)
+              echo TEST_INVALID: $TEST_INVALID
+
+              TEST_PACKAGES=""
+              if [ -n "$TEST_FAILURES" ] || \
+                 [ -n "$TEST_INVALID" ]
+              then
+                TEST_PACKAGES=$(
+                  colcon list \
+                    --names-only \
+                    --packages-above \
+                      $TEST_FAILURES \
+                      $TEST_INVALID)
+              fi
+              if ( ! << parameters.cache_test >> )
+              then
+                TEST_PACKAGES=$(
+                  colcon list \
+                    --names-only)
+              fi
               TEST_PACKAGES=$(
-                colcon list --names-only | \
-                  circleci tests split \
-                    --split-by=timings \
-                    --timings-type=classname \
-                    --show-counts | \
-                  xargs)
+                echo $TEST_PACKAGES \
+                | circleci tests split \
+                  --split-by=timings \
+                  --timings-type=classname \
+                  --show-counts \
+                | xargs)
+              echo TEST_PACKAGES: $TEST_PACKAGES
+
+              . install/setup.sh
               set -o xtrace
               colcon test \
-                --packages-select ${TEST_PACKAGES} \
-                --retest-until-pass ${RETEST_UNTIL_PASS} \
-                --ctest-args --test-regex "test_.*"
+                --packages-select ${TEST_PACKAGES}
               colcon test-result \
                 --verbose
+        - when:
+            condition: << parameters.cache_test >>
+            steps:
+              - save_to_cache:
+                  key: << parameters.key >>
+                  path: << parameters.workspace >>
+                  workspace: << parameters.workspace >>
+                  when: always
         - run:
             name: Copy Test Logs
             working_directory: << parameters.workspace >>
@@ -179,6 +265,20 @@ _commands:
             path: << parameters.workspace >>/test_results
         - store_artifacts:
             path: << parameters.workspace >>/test_results
+    check_apt_updates:
+      description: "Check apt updates"
+      parameters:
+        sourcelist:
+          type: string
+      steps:
+        - run:
+            command: |
+              apt-get update \
+                -o Dir::Etc::sourcelist="<< parameters.sourcelist >>"
+              apt-get --simulate upgrade \
+                -o Dir::Etc::sourcelist="<< parameters.sourcelist >>" \
+                | grep "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded." \
+                && echo "No apt updates" || exit 1
     trigger_dockerhub_url:
       description: "Trigger Dockerhub URL"
       parameters:
@@ -186,6 +286,7 @@ _commands:
           type: string
       steps:
         - run:
+            when: on_fail
             command: |
               curl -H "Content-Type: application/json" \
                 --data '<< parameters.data >>' \
@@ -196,16 +297,16 @@ _steps:
     run:
       name: Pre Checkout
       command: |
-        mkdir -p $ROS_WS && cd $ROS_WS
+        mkdir -p $ROS_WS/src && cd $ROS_WS
         ln -s /opt/ros/$ROS_DISTRO install
         echo $CACHE_NONCE | \
-          (echo cache_nonce && cat) >> checksum.txt
-        sha256sum $PWD/checksum.txt >> checksum.txt
+          (echo cache_nonce && cat) >> lockfile.txt
+        sha256sum $PWD/lockfile.txt >> lockfile.txt
         TZ=utc stat -c '%y' /ros_entrypoint.sh | \
-          (echo ros_entrypoint && cat) >> checksum.txt
-        sha256sum $PWD/checksum.txt >> checksum.txt
-        rm -rf $OVERLAY_WS/*
+          (echo ros_entrypoint && cat) >> lockfile.txt
+        sha256sum $PWD/lockfile.txt >> lockfile.txt
         mv ~/.ccache $CCACHE_DIR
+        rm -rf $OVERLAY_WS/src
   on_checkout: &on_checkout
     checkout:
       path: src/navigation2
@@ -218,11 +319,9 @@ _steps:
           $OVERLAY_WS/src/navigation2/tools/underlay.repos \
           $UNDERLAY_WS/underlay.repos >/dev/null 2>&1
         then
-          echo "Cleaning Underlay"
-          rm -rf $UNDERLAY_WS/*
+          echo "Importing Underlay"
           cp $OVERLAY_WS/src/navigation2/tools/underlay.repos \
             $UNDERLAY_WS/underlay.repos
-          mkdir -p $UNDERLAY_WS/src
           vcs import $UNDERLAY_WS/src \
             < $UNDERLAY_WS/underlay.repos
         fi
@@ -277,7 +376,9 @@ _steps:
       when: always
   test_overlay_workspace: &test_overlay_workspace
     test_workspace:
+      key: overlay_ws
       workspace: /opt/overlay_ws
+      cache_test: << parameters.cache_test >>
   collect_overlay_coverage: &collect_overlay_coverage
     run:
       name: Collect Code Coverage
@@ -290,7 +391,7 @@ _steps:
       working_directory: /opt/overlay_ws
       command: |
         curl -s https://codecov.io/bash > codecov
-        local codecov_version=$(grep -o 'VERSION=\"[0-9\.]*\"' codecov | cut -d'"' -f2)
+        codecov_version=$(grep -o 'VERSION=\"[0-9\.]*\"' codecov | cut -d'"' -f2)
         shasum -a 512 -c <(curl -s "https://raw.githubusercontent.com/codecov/codecov-bash/${codecov_version}/SHA512SUM" | grep -w "codecov")
         bash codecov \
           -f "lcov/project_coverage.info" \
@@ -300,6 +401,9 @@ _steps:
           -F "project" \
           -Z || echo 'Codecov upload failed'
       when: always
+  check_ros2_updates: &check_ros2_updates
+    check_apt_updates:
+        sourcelist: sources.list.d/ros2.list
   trigger_dockerhub_build: &trigger_dockerhub_build
     trigger_dockerhub_url:
         data: |
@@ -342,6 +446,9 @@ commands:
       - *restore_overlay_workspace
   test_build:
     description: "Test Build"
+    parameters:
+      cache_test:
+        type: boolean
     steps:
       - *test_overlay_workspace
   report_coverage:
@@ -352,6 +459,7 @@ commands:
   trigger_dockerhub:
     description: "Trigger DockerHub"
     steps:
+      - *check_ros2_updates
       - *trigger_dockerhub_build
 
 _environments:
@@ -359,6 +467,7 @@ _environments:
     ROS_WS: "/opt/ros_ws"
     UNDERLAY_WS: "/opt/underlay_ws"
     OVERLAY_WS: "/opt/overlay_ws"
+    UNDERLAY_MIXINS: "release ccache"
     CCACHE_DIR: "/tmp/.ccache"
     CCACHE_LOGFILE: "/tmp/ccache.log"
     CCACHE_MAXSIZE: "200M"
@@ -366,7 +475,6 @@ _environments:
     COLCON_DEFAULTS_FILE: "/tmp/defaults.yaml"
     RCUTILS_LOGGING_BUFFERED_STREAM: "0"
     RCUTILS_LOGGING_USE_STDOUT: "0"
-    RETEST_UNTIL_PASS: "2"
     DEBIAN_FRONTEND: "noninteractive"
 
 executors:
@@ -378,7 +486,6 @@ executors:
       <<: *common_environment
       CACHE_NONCE: "Debug"
       OVERLAY_MIXINS: "debug ccache coverage-gcc"
-      UNDERLAY_MIXINS: "release ccache"
   release_exec:
     docker:
       - image: rosplanning/navigation2:main.release
@@ -387,14 +494,13 @@ executors:
       <<: *common_environment
       CACHE_NONCE: "Release"
       OVERLAY_MIXINS: "release ccache"
-      UNDERLAY_MIXINS: "release ccache"
-  python_exec:
-    docker:
-      - image: circleci/python
 
 _jobs:
   job_test: &job_test
     parameters:
+      cache_test:
+        type: boolean
+        default: false
       rmw:
         default: "rmw_cyclonedds_cpp"
         type: string
@@ -417,16 +523,18 @@ jobs:
     executor: debug_exec
     steps:
       - restore_build
-      - test_build
+      - test_build:
+          cache_test: << parameters.cache_test >>
       - report_coverage
   release_test:
     <<: *job_test
     executor: release_exec
     steps:
       - restore_build
-      - test_build
+      - test_build:
+          cache_test: << parameters.cache_test >>
   rebuild_dockerhub:
-    executor: python_exec
+    executor: release_exec
     steps:
       - trigger_dockerhub
 
@@ -438,10 +546,12 @@ workflows:
       - debug_test:
           requires:
             - debug_build
+          cache_test: true
       - release_build
       - release_test:
           requires:
             - release_build
+          cache_test: true
   nightly:
     jobs:
       - debug_build
